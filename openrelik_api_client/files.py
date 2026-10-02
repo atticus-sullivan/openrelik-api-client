@@ -141,9 +141,6 @@ class FilesAPI:
         CHUNK_RETRY_INTERVAL = 0.5  # seconds
         CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
 
-        if not file.seekable():
-            raise ValueError("file must be seekable")
-
         file_id = None
         response = None
         endpoint = "/files/upload"
