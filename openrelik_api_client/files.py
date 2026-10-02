@@ -84,6 +84,7 @@ class FilesAPI:
         else:
             raise ValueError("Invalid return_type. Must be 'bytes' or 'text'.")
 
+
     def download_file(self, file_id: int, filename: str) -> str | None:
         """Downloads a file from OpenRelik.
 
@@ -118,20 +119,39 @@ class FilesAPI:
         Raise:
             FileNotFoundError: if file_path is not found.
         """
+        with open(file_path, "rb") as fh:
+            total_size = Path(file_path).stat().st_size
+            return self.upload_fileobj(fh, file_path, folder_id, total_size)
+
+    def upload_fileobj(
+            self, file: BinaryIO, file_path_str: str, folder_id: int, file_size: int
+    ) -> int | None:
+        """Stream a file-like object to OpenRelik.
+
+        Args:
+            file: File contents via File object.
+            file_path_str: Original path, used to determine the filename.
+            folder_id: An existing OpenRelik folder identifier.
+            file_size: Total size of the file in bytes.
+
+        Returns:
+            file_id of the uploaded file or None otherwise.
+        """
         MAX_CHUNK_RETRIES = 10  # Maximum number of retries for chunk upload
         CHUNK_RETRY_INTERVAL = 0.5  # seconds
+        CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
+
+        if not file.seekable():
+            raise ValueError("file must be seekable")
 
         file_id = None
         response = None
         endpoint = "/files/upload"
-        chunk_size = 10 * 1024 * 1024  # 10 MB
         resumableTotalChunks = 0
         resumableChunkNumber = 0
         resumableIdentifier = uuid4().hex
-        file_path = Path(file_path)
+        file_path = Path(file_path_str)
         resumableFilename = file_path.name
-        if not file_path.exists():
-            raise FileNotFoundError(f"File {file_path} not found.")
 
         if folder_id:
             response = self.api_client.session.get(
@@ -140,50 +160,48 @@ class FilesAPI:
             if response.status_code == 404:
                 return file_id
 
-        with open(file_path, "rb") as fh:
-            total_size = Path(file_path).stat().st_size
-            resumableTotalChunks = math.ceil(total_size / chunk_size)
-            while chunk := fh.read(chunk_size):
-                resumableChunkNumber += 1
-                retry_count = 0
-                while retry_count < MAX_CHUNK_RETRIES:
-                    params = {
-                        "resumableRelativePath": resumableFilename,
-                        "resumableTotalSize": total_size,
-                        "resumableCurrentChunkSize": len(chunk),
-                        "resumableChunkSize": chunk_size,
-                        "resumableChunkNumber": resumableChunkNumber,
-                        "resumableTotalChunks": resumableTotalChunks,
-                        "resumableIdentifier": resumableIdentifier,
-                        "resumableFilename": resumableFilename,
-                        "folder_id": folder_id,
-                    }
-                    encoder = MultipartEncoder(
-                        {"file": (file_path.name, chunk, "application/octet-stream")}
-                    )
-                    headers = {"Content-Type": encoder.content_type}
-                    response = self.api_client.session.post(
-                        f"{self.api_client.base_url}{endpoint}",
-                        headers=headers,
-                        data=encoder.to_string(),
-                        params=params,
-                    )
-                    if response.status_code == 200 or response.status_code == 201:
-                        # Success, move to the next chunk
-                        break
-                    elif response.status_code == 503:
-                        # Server has issue saving the chunk, retry the upload.
-                        retry_count += 1
-                        time.sleep(CHUNK_RETRY_INTERVAL)
-                    elif response.status_code == 429:
-                        # Rate limit exceeded, cancel the upload and raise an error.
-                        raise RuntimeError("Upload failed, maximum retries exceeded")
-                    else:
-                        # Other errors, cancel the upload and raise an error.
-                        raise RuntimeError("Upload failed")
+        resumableTotalChunks = math.ceil(file_size / CHUNK_SIZE)
+        while chunk := file.read(CHUNK_SIZE):
+            resumableChunkNumber += 1
+            retry_count = 0
+            while retry_count < MAX_CHUNK_RETRIES:
+                params = {
+                    "resumableRelativePath": resumableFilename,
+                    "resumableTotalSize": file_size,
+                    "resumableCurrentChunkSize": len(chunk),
+                    "resumableChunkSize": CHUNK_SIZE,
+                    "resumableChunkNumber": resumableChunkNumber,
+                    "resumableTotalChunks": resumableTotalChunks,
+                    "resumableIdentifier": resumableIdentifier,
+                    "resumableFilename": resumableFilename,
+                    "folder_id": folder_id,
+                }
+                encoder = MultipartEncoder(
+                    {"file": (file_path.name, chunk, "application/octet-stream")}
+                )
+                headers = {"Content-Type": encoder.content_type}
+                response = self.api_client.session.post(
+                    f"{self.api_client.base_url}{endpoint}",
+                    headers=headers,
+                    data=encoder,
+                    params=params,
+                )
+                if response.status_code == 200 or response.status_code == 201:
+                    # Success, move to the next chunk
+                    break
+                elif response.status_code == 503:
+                    # Server has issue saving the chunk, retry the upload.
+                    retry_count += 1
+                    time.sleep(CHUNK_RETRY_INTERVAL)
+                elif response.status_code == 429:
+                    # Rate limit exceeded, cancel the upload and raise an error.
+                    raise RuntimeError("Upload failed, maximum retries exceeded")
+                else:
+                    # Other errors, cancel the upload and raise an error.
+                    raise RuntimeError("Upload failed")
 
-            if response and response.status_code == 201:
-                file_id = response.json().get("id")
+        if response and response.status_code == 201:
+            file_id = response.json().get("id")
 
         return file_id
 
